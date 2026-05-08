@@ -64,7 +64,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           at::Tensor dv,
                                           float softmax_scale,
                                           float p_dropout,
-                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                          std::pair<const void*, const void*> drop_seed_offset)
 {
     ck_tile::index_t total_q = q.size(0);
     ck_tile::index_t total_k = k.size(0);
@@ -118,10 +118,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
     ck_tile::index_t nhead_stride_dv = dv.stride(1);
 
     // dq_acc: (nheads, split, total_q, hdim)
-    ck_tile::long_index_t batch_stride_dq_acc = 0;
-    ck_tile::long_index_t nhead_stride_dq_acc = dq_acc.stride(0);
-    ck_tile::index_t split_stride_dq_acc = dq_acc.stride(1);
-    ck_tile::index_t stride_dq_acc = dq_acc.stride(2);
+    // NOTE: dq_acc stride fields removed from CK fmha_bwd_args, workspace_ptr used instead
 
     float p_undrop = 1.0 - p_dropout;
 
@@ -151,7 +148,9 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          dk.data_ptr(),
                          dv.data_ptr(),
                          nullptr, // dbias
-                         dq_acc.data_ptr(), // dq_acc
+                         dq_acc.data_ptr(), // workspace_ptr
+                         nullptr, // sink_ptr
+                         nullptr, // d_sink_ptr
                          seqlens_q.data_ptr(), // seqstart_q_ptr
                          seqlens_k.data_ptr(), // seqstart_k_ptr
                          nullptr, // seqlen_q_ptr
@@ -175,7 +174,6 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          stride_o,
                          0, // stride_randval
                          stride_do,
-                         stride_dq_acc,
                          stride_dq,
                          stride_dk,
                          stride_dv,
@@ -188,7 +186,6 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          0, // nhead_stride_randval
                          nhead_stride_do,
                          nhead_stride_lse,
-                         nhead_stride_dq_acc,
                          nhead_stride_dq,
                          nhead_stride_dk,
                          nhead_stride_dv,
@@ -201,12 +198,10 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          0, // batch_stride_randval
                          batch_stride_do,
                          batch_stride_lse,
-                         batch_stride_dq_acc,
                          batch_stride_dq,
                          batch_stride_dk,
                          batch_stride_dv,
                          0  , // batch_stride_dbias, FA without dbias
-                         split_stride_dq_acc,
                          mask.left,
                          mask.right,
                          static_cast<ck_tile::index_t>(mask.type),
@@ -358,7 +353,6 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         alibi_slopes_.has_value(),
         deterministic);
     fmha_bwd_launcher launcher(traits);
-    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
 
     at::cuda::CUDAGuard device_guard{q.device()};
 
@@ -367,7 +361,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         flash::check_gfx1x_bwd_supported(deterministic);
     }
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor dq_accum  = torch::zeros({num_heads, nsplits, total_q, head_size}, opts.dtype(at::kFloat));
+    at::Tensor dq_accum  = torch::empty({static_cast<int64_t>(launcher.workspace_size)}, opts.dtype(at::kByte));
+    launcher.prepare_workspace(dq_accum.data_ptr());
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -407,7 +402,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
 
     if (max_seqlen_q > 0) {
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
-        auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
+        auto drop_seed_offset = std::make_pair(reinterpret_cast<const void*>(rng_state_ptr), reinterpret_cast<const void*>(rng_state_ptr + 1));
         ck_tile::stream_config stream_config{stream};
 
         auto args =

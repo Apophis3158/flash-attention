@@ -67,7 +67,11 @@ FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE
 ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
 if IS_ROCM:
     ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
-NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
+    NVCC_THREADS = "1"  # No --threads option in hipcc
+    MEM_PER_THREAD = 2
+else:
+    NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
+    MEM_PER_THREAD = 5
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
@@ -219,7 +223,7 @@ ext_modules = []
 
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if IS_ROCM:
+""" if IS_ROCM:
     if ROCM_BACKEND == "triton":
         if os.path.isdir(".git"):
             subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
@@ -245,7 +249,7 @@ else:
     else:
         assert os.path.exists("csrc/cutlass/include/cutlass/cutlass.h"), (
             "csrc/cutlass is missing, please use source distribution or git clone"
-        )
+        ) """
 
 if not SKIP_CUDA_BUILD and not IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -477,6 +481,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                         "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
 
         cc_flag += ["-O3","-std=c++20",
+                    "-x", "hip",  # for sccache
                     "-Wno-unknown-warning-option",
                     "-fbracket-depth=1024",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
@@ -488,6 +493,10 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                     "-DCK_ENABLE_FP64",
                     "-DCK_ENABLE_FP8",
                     "-DCK_ENABLE_INT8",
+                    "-Wno-unused-command-line-argument",
+                    "-Wno-shift-count-overflow",
+                    "-Wno-pass-failed",
+                    "-Wno-inconsistent-dllimport",
                     "-DCK_USE_XDL",
                     "-DUSE_PROF_API=1",
                     # "-DFLASHATTENTION_DISABLE_BACKWARD",
@@ -590,6 +599,7 @@ class CachedWheelsCommand(_bdist_wheel):
 
         wheel_url, wheel_filename = get_wheel_url()
         print("Guessing wheel URL: ", wheel_url)
+        wheel_downloaded = False
         try:
             urllib.request.urlretrieve(wheel_url, wheel_filename)
 
@@ -605,9 +615,10 @@ class CachedWheelsCommand(_bdist_wheel):
             wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
             print("Raw wheel path", wheel_path)
             os.rename(wheel_filename, wheel_path)
+            wheel_downloaded = True
         except (urllib.error.HTTPError, urllib.error.URLError):
             print("Precompiled wheel not found. Building from source...")
-            # If the wheel could not be downloaded, build from source
+        if not wheel_downloaded:
             super().run()
 
 
@@ -626,7 +637,7 @@ class NinjaBuildExtension(BuildExtension):
             free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
             # Assume worst-case peak observed memory usage of ~5GB per NVCC thread.
             # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= free_memory.
-            max_num_jobs_memory = max(1, int(free_memory_gb / (5 * nvcc_threads)))
+            max_num_jobs_memory = max(1, int(free_memory_gb / (MEM_PER_THREAD * nvcc_threads)))
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
             max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
@@ -646,6 +657,23 @@ class NinjaBuildExtension(BuildExtension):
             def spawn(cmd):
                 if not cmd or Path(str(cmd[0])).name.lower() != "link.exe":
                     return original_spawn(cmd)
+
+                # test linker
+                # def _find_lld_link():
+                #     if ROCM_HOME:
+                #         candidate = os.path.join(ROCM_HOME, 'lib', 'llvm', 'bin', 'lld-link.exe')
+                #         if os.path.isfile(candidate):
+                #             return candidate
+                #     for p in os.environ.get('PATH', '').split(os.pathsep):
+                #         candidate = os.path.join(p, 'lld-link.exe')
+                #         if os.path.isfile(candidate):
+                #             return candidate
+                #     return None
+
+                # _lld_link = _find_lld_link()
+                # if _lld_link:
+                #     cmd[0] = _lld_link
+
                 cmd = [str(arg) for arg in cmd]
                 if len(subprocess.list2cmdline(cmd)) <= 32767:
                     return original_spawn(cmd)
